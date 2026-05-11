@@ -68,4 +68,4 @@ RUN addgroup -S helmusr && adduser -S helmusr -G helmusr && \
 
 USER helmusr
 WORKDIR /workspace
-ENTRYPOINT ["helm4"]
+ENTRYPOINT ["helm"]
