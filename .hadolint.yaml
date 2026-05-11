@@ -1,0 +1,8 @@
+# hadolint configuration for tcwlab/helm
+#
+# DL3018: Pin versions in apk add
+# Alpine images intentionally do not pin apk package versions, as they use the
+# Alpine repository as the source of truth and update only with apk upgrade.
+# Version pinning would break across Alpine releases.
+ignore:
+  - DL3018

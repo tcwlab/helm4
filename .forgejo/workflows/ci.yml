@@ -1,0 +1,442 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# tcwlab / helm — Build & Publish
+#
+# No inline downloads. All tools are pre-installed in specialized,
+# versioned images:
+#   tcwlab/betterlint:latest → Dockerfile linting
+#   tcwlab/buildx:0.33.0    → docker build / buildx (amd64 + arm64)
+#
+# Checkout: shell-based (git init + git fetch) — no Node.js needed.
+# Docker daemon: direct access via tcp://docker-in-docker:2375 (runner-net).
+#
+# Versioning: Semantic Release (v*.*.*) via release.yml
+#   → tcwlab/helm4:<tool-version>-<semver>  immutable  (e.g. 4.1.4-1.2.3)
+#   → tcwlab/helm4:<tool-version>            float      (e.g. 4.1.4)
+#   → tcwlab/helm4:latest                    float
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: ci
+
+on:
+  push:
+    branches: [main, "feature/*", "claude/*"]
+    tags: ["v*.*.*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: tcwlab/helm4
+  DOCKER_BUILDKIT: "1"
+
+jobs:
+
+  # ---------------------------------------------------------------------------
+  lint:
+    name: Lint
+    runs-on: ubuntu-22.04
+    container:
+      image: tcwlab/betterlint:latest
+    steps:
+      - name: Checkout
+        env:
+          GITHUB_TOKEN: ${{ secrets.FORGEJO_TOKEN }}
+        run: |
+          git config --global init.defaultBranch main
+          git init .
+          git remote add origin \
+            "https://oauth2:${GITHUB_TOKEN}@git.mon.k8b.co/${GITHUB_REPOSITORY}.git"
+          git fetch --depth=1 origin "${GITHUB_SHA}"
+          git checkout FETCH_HEAD
+
+      - name: Run betterlint
+        run: |
+          set +e
+          betterlint --dir . --markdown 2>&1 | tee /tmp/betterlint-report.md
+          LINT_EXIT="${PIPESTATUS[0]}"
+          exit "${LINT_EXIT}"
+
+      - name: Post betterlint result as PR comment
+        if: always()
+        env:
+          FORGEJO_TOKEN: ${{ secrets.FORGEJO_TOKEN }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_BRANCH: ${{ github.head_ref || github.ref_name }}
+          REPO: ${{ github.repository }}
+          IMAGE_REF: "tcwlab/betterlint:latest"
+        run: |
+          python3 << 'EOF'
+          import os, json, urllib.request, urllib.error
+          from datetime import datetime, timezone
+
+          MARKER  = "<!-- betterlint-report -->"
+          token   = os.environ["FORGEJO_TOKEN"]
+          repo    = os.environ["REPO"]
+          event   = os.environ["GITHUB_EVENT_NAME"]
+          api     = "https://git.mon.k8b.co/api/v1"
+          hdrs    = {"Authorization": f"token {token}", "Content-Type": "application/json"}
+
+          def get(url):
+              req = urllib.request.Request(url, headers=hdrs)
+              with urllib.request.urlopen(req) as r:
+                  return json.loads(r.read())
+
+          def post(url, body):
+              req = urllib.request.Request(
+                  url, data=json.dumps(body).encode(), headers=hdrs, method="POST")
+              with urllib.request.urlopen(req) as r:
+                  return r.status
+
+          def patch(url, body):
+              req = urllib.request.Request(
+                  url, data=json.dumps(body).encode(), headers=hdrs, method="PATCH")
+              with urllib.request.urlopen(req) as r:
+                  return r.status
+
+          pr_number = None
+          if event == "pull_request":
+              pr_number = os.environ["PR_NUMBER"]
+          else:
+              branch = os.environ["HEAD_BRANCH"]
+              try:
+                  for pr in get(f"{api}/repos/{repo}/pulls?state=open&limit=50"):
+                      if pr.get("head", {}).get("ref") == branch:
+                          pr_number = str(pr["number"])
+                          break
+              except urllib.error.URLError as e:
+                  print(f"PR search failed: {e}")
+
+          if not pr_number:
+              print("No open PR — comment will not be posted")
+              raise SystemExit(0)
+
+          try:
+              with open("/tmp/betterlint-report.md") as f:
+                  report = f.read().strip()
+          except FileNotFoundError:
+              report = "**⚠️ betterlint report not found**"
+
+          scan_date = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+          comment   = f"{MARKER}\n{report}\n\n_Scanned: `{os.environ['IMAGE_REF']}` — {scan_date}_"
+
+          existing_id = None
+          page = 1
+          while True:
+              comments = get(f"{api}/repos/{repo}/issues/{pr_number}/comments?limit=50&page={page}")
+              if not comments:
+                  break
+              for c in comments:
+                  if MARKER in (c.get("body") or ""):
+                      existing_id = c["id"]
+                      break
+              if existing_id or len(comments) < 50:
+                  break
+              page += 1
+
+          if existing_id:
+              try:
+                  status = patch(f"{api}/repos/{repo}/issues/comments/{existing_id}", {"body": comment})
+                  print(f"PR #{pr_number}: betterlint comment updated (HTTP {status})")
+              except urllib.error.HTTPError as e:
+                  if e.code >= 500:
+                      print(f"PATCH failed ({e.code}) — creating new comment")
+                      status = post(f"{api}/repos/{repo}/issues/{pr_number}/comments", {"body": comment})
+                      print(f"PR #{pr_number}: betterlint comment created (HTTP {status})")
+                  else:
+                      raise
+          else:
+              status = post(f"{api}/repos/{repo}/issues/{pr_number}/comments", {"body": comment})
+              print(f"PR #{pr_number}: betterlint comment created (HTTP {status})")
+          EOF
+
+  # ---------------------------------------------------------------------------
+  build-test:
+    name: Build & Smoke Test (amd64)
+    runs-on: ubuntu-22.04
+    container:
+      image: tcwlab/buildx:0.33.0
+    env:
+      DOCKER_HOST: tcp://docker-in-docker:2375
+    steps:
+      - name: Checkout
+        env:
+          GITHUB_TOKEN: ${{ secrets.FORGEJO_TOKEN }}
+        run: |
+          git config --global init.defaultBranch main
+          git init .
+          git remote add origin \
+            "https://oauth2:${GITHUB_TOKEN}@git.mon.k8b.co/${GITHUB_REPOSITORY}.git"
+          git fetch --depth=1 origin "${GITHUB_SHA}"
+          git checkout FETCH_HEAD
+
+      - name: Build (amd64)
+        run: docker build -t "${{ env.IMAGE }}:test" .
+
+      - name: Smoke Test
+        run: docker run --rm "${{ env.IMAGE }}:test" version --short
+
+      - name: Docker Hub Login
+        run: |
+          echo "${{ secrets.DOCKERHUB_TOKEN }}" \
+            | docker login --username "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
+
+      - name: Push to Staging
+        run: |
+          TOOL=$(echo "${{ env.IMAGE }}" | cut -d'/' -f2)
+          docker tag "${{ env.IMAGE }}:test" "tcwlab/forgejo-build:${TOOL}-${{ github.sha }}"
+          docker push "tcwlab/forgejo-build:${TOOL}-${{ github.sha }}"
+
+  # ---------------------------------------------------------------------------
+  security:
+    name: Trivy Security Scan
+    runs-on: ubuntu-22.04
+    needs: [build-test]
+    env:
+      DOCKER_HOST: tcp://docker-in-docker:2375
+    steps:
+      - name: Install Docker CLI
+        run: |
+          curl -fsSL \
+            "https://download.docker.com/linux/static/stable/x86_64/docker-29.4.2.tgz" \
+            -o /tmp/docker.tgz
+          tar xzf /tmp/docker.tgz --strip-components=1 -C /usr/local/bin docker/docker
+
+      - name: Trivy Scan (JSON)
+        run: |
+          TOOL=$(echo "${{ env.IMAGE }}" | cut -d'/' -f2)
+          docker run --rm \
+            -e TRIVY_USERNAME="${{ secrets.DOCKERHUB_USERNAME }}" \
+            -e TRIVY_PASSWORD="${{ secrets.DOCKERHUB_TOKEN }}" \
+            tcwlab/trivy:0.70.0 image \
+            --exit-code 0 --severity HIGH,CRITICAL --ignore-unfixed \
+            --format json \
+            "tcwlab/forgejo-build:${TOOL}-${{ github.sha }}" \
+            > /tmp/trivy-report.json
+
+      - name: Post Trivy result as PR comment
+        env:
+          FORGEJO_TOKEN: ${{ secrets.FORGEJO_TOKEN }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_BRANCH: ${{ github.head_ref || github.ref_name }}
+          REPO: ${{ github.repository }}
+          SCANNED_IMAGE: "tcwlab/forgejo-build:helm4-${{ github.sha }}"
+          TRIVY_IMAGE: "tcwlab/trivy:0.70.0"
+        run: |
+          python3 << 'EOF'
+          import os, json, urllib.request, urllib.error
+          from datetime import datetime, timezone
+
+          MARKER  = "<!-- trivy-report -->"
+          token   = os.environ["FORGEJO_TOKEN"]
+          repo    = os.environ["REPO"]
+          event   = os.environ["GITHUB_EVENT_NAME"]
+          api     = "https://git.mon.k8b.co/api/v1"
+          hdrs    = {"Authorization": f"token {token}", "Content-Type": "application/json"}
+
+          def get(url):
+              req = urllib.request.Request(url, headers=hdrs)
+              with urllib.request.urlopen(req) as r:
+                  return json.loads(r.read())
+
+          def post(url, body):
+              req = urllib.request.Request(
+                  url, data=json.dumps(body).encode(), headers=hdrs, method="POST")
+              with urllib.request.urlopen(req) as r:
+                  return r.status
+
+          def patch(url, body):
+              req = urllib.request.Request(
+                  url, data=json.dumps(body).encode(), headers=hdrs, method="PATCH")
+              with urllib.request.urlopen(req) as r:
+                  return r.status
+
+          # Determine PR number
+          pr_number = None
+          if event == "pull_request":
+              pr_number = os.environ["PR_NUMBER"]
+          else:
+              branch = os.environ["HEAD_BRANCH"]
+              try:
+                  for pr in get(f"{api}/repos/{repo}/pulls?state=open&limit=50"):
+                      if pr.get("head", {}).get("ref") == branch:
+                          pr_number = str(pr["number"])
+                          break
+              except urllib.error.URLError as e:
+                  print(f"PR search failed: {e}")
+
+          if not pr_number:
+              print("No open PR — comment will not be posted")
+              raise SystemExit(0)
+
+          # Build report
+          with open("/tmp/trivy-report.json") as f:
+              report = json.load(f)
+
+          icon = {"CRITICAL": "🔴", "HIGH": "🟠"}
+          rows = []
+          for result in report.get("Results", []):
+              for v in result.get("Vulnerabilities") or []:
+                  sev   = v.get("Severity", "")
+                  pkg   = v.get("PkgName", "")
+                  inst  = v.get("InstalledVersion", "")
+                  fixed = v.get("FixedVersion", "") or "—"
+                  cve   = v.get("VulnerabilityID", "")
+                  url   = next(
+                      (r for r in v.get("References", []) if "nvd.nist.gov" in r),
+                      v.get("PrimaryURL", ""))
+                  cve_link = f"[{cve}]({url})" if url else cve
+                  rows.append((sev, icon.get(sev, "⚪"), pkg, inst, fixed, cve_link))
+
+          rows.sort(key=lambda r: ({"CRITICAL": 0, "HIGH": 1}.get(r[0], 9), r[2]))
+          counts = {s: sum(1 for r in rows if r[0] == s) for s in ["CRITICAL", "HIGH"]}
+          total  = sum(counts.values())
+
+          if total == 0:
+              body = "**✅ Security Scan — no HIGH/CRITICAL vulnerabilities**"
+          else:
+              parts = [f"{counts[s]} {s}" for s in ["CRITICAL", "HIGH"] if counts[s]]
+              body  = f"**⚠️ Security Scan — {', '.join(parts)}** (fixable vulnerabilities only)\n\n"
+              body += "| Severity | Package | Installed | Fixed | CVE |\n"
+              body += "| --- | --- | --- | --- | --- |\n"
+              for _, ico, pkg, inst, fixed, cve_link in rows:
+                  body += f"| {ico} | `{pkg}` | {inst} | {fixed} | {cve_link} |\n"
+
+          scan_date = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+          comment   = (
+              f"{MARKER}\n{body}\n\n"
+              f"_Scanned: `{os.environ['SCANNED_IMAGE']}` "
+              f"· Tool: `{os.environ['TRIVY_IMAGE']}` "
+              f"· {scan_date}_"
+          )
+
+          # Search for existing comment (paginated, max 200)
+          existing_id = None
+          page = 1
+          while True:
+              comments = get(f"{api}/repos/{repo}/issues/{pr_number}/comments?limit=50&page={page}")
+              if not comments:
+                  break
+              for c in comments:
+                  if MARKER in (c.get("body") or ""):
+                      existing_id = c["id"]
+                      break
+              if existing_id or len(comments) < 50:
+                  break
+              page += 1
+
+          if existing_id:
+              try:
+                  status = patch(f"{api}/repos/{repo}/issues/comments/{existing_id}", {"body": comment})
+                  print(f"PR #{pr_number}: trivy comment updated (HTTP {status})")
+              except urllib.error.HTTPError as e:
+                  if e.code >= 500:
+                      print(f"PATCH failed ({e.code}) — creating new comment")
+                      status = post(f"{api}/repos/{repo}/issues/{pr_number}/comments", {"body": comment})
+                      print(f"PR #{pr_number}: trivy comment created (HTTP {status})")
+                  else:
+                      raise
+          else:
+              status = post(f"{api}/repos/{repo}/issues/{pr_number}/comments", {"body": comment})
+              print(f"PR #{pr_number}: trivy comment created (HTTP {status})")
+          EOF
+
+  # ---------------------------------------------------------------------------
+  publish:
+    name: Publish to Docker Hub (linux/amd64 + linux/arm64)
+    runs-on: ubuntu-22.04
+    needs: [lint, security]
+    if: startsWith(github.ref, 'refs/tags/v')
+    container:
+      image: tcwlab/buildx:0.33.0
+    env:
+      DOCKER_HOST: tcp://docker-in-docker:2375
+    steps:
+      - name: Checkout
+        env:
+          GITHUB_TOKEN: ${{ secrets.FORGEJO_TOKEN }}
+        run: |
+          git config --global init.defaultBranch main
+          git init .
+          git remote add origin \
+            "https://oauth2:${GITHUB_TOKEN}@git.mon.k8b.co/${GITHUB_REPOSITORY}.git"
+          git fetch --depth=1 origin "${GITHUB_SHA}"
+          git checkout FETCH_HEAD
+
+      - name: Extract versions from tag
+        id: version
+        run: |
+          SEMVER="${GITHUB_REF#refs/tags/v}"
+          TOOL_VER=$(grep '^ARG HELM_VERSION=' Dockerfile | head -1 | cut -d= -f2)
+          echo "semver=${SEMVER}"         >> "$GITHUB_OUTPUT"
+          echo "tool_version=${TOOL_VER}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU (arm64 emulation)
+        run: docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
+
+      - name: Set up Buildx builder
+        run: |
+          docker buildx create --name multiarch --driver docker-container --use
+          docker buildx inspect --bootstrap
+
+      - name: Docker Hub Login
+        run: |
+          echo "${{ secrets.DOCKERHUB_TOKEN }}" \
+            | docker login --username "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
+
+      - name: Build & Push (multi-arch)
+        run: |
+          SEMVER="${{ steps.version.outputs.semver }}"
+          TOOL_VER="${{ steps.version.outputs.tool_version }}"
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            --sbom=true \
+            --provenance=mode=max \
+            --build-arg HELM_VERSION="${TOOL_VER}" \
+            -t "${{ env.IMAGE }}:${TOOL_VER}-${SEMVER}" \
+            -t "${{ env.IMAGE }}:${TOOL_VER}" \
+            -t "${{ env.IMAGE }}:latest" \
+            --push \
+            .
+
+  # ---------------------------------------------------------------------------
+  sync-readme:
+    name: Sync README to Docker Hub
+    runs-on: ubuntu-22.04
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    container:
+      image: alpine:3.23
+    steps:
+      - name: Checkout
+        env:
+          GITHUB_TOKEN: ${{ secrets.FORGEJO_TOKEN }}
+        run: |
+          apk add --no-cache git jq curl ca-certificates
+          git config --global init.defaultBranch main
+          git init .
+          git remote add origin \
+            "https://oauth2:${GITHUB_TOKEN}@git.mon.k8b.co/${GITHUB_REPOSITORY}.git"
+          git fetch --depth=1 origin "${GITHUB_SHA}"
+          git checkout FETCH_HEAD
+
+      - name: Push README to Docker Hub
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          REPO: helm4
+        run: |
+          set -euo pipefail
+          TOKEN=$(curl -fsS -H "Content-Type: application/json" -X POST \
+            -d "{\"username\":\"$DOCKERHUB_USERNAME\",\"password\":\"$DOCKERHUB_TOKEN\"}" \
+            https://hub.docker.com/v2/users/login/ | jq -r .token)
+          curl -fsS -X PATCH \
+            -H "Authorization: JWT $TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n --rawfile body README.md '{full_description: $body}')" \
+            "https://hub.docker.com/v2/repositories/tcwlab/${REPO}/" > /dev/null
+          echo "✓ README synced to hub.docker.com/r/tcwlab/${REPO}"

@@ -1,0 +1,98 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# tcwlab / helm — Semantic Release
+#
+# Runs only on main. Analyses Conventional Commits since the last tag,
+# creates a Forgejo release (with changelog), and dispatches ci.yml for
+# the new tag so that the publish job pushes to Docker Hub.
+#
+# Plugins:
+#   @semantic-release/commit-analyzer        → determine the release type
+#   @semantic-release/release-notes-generator → generate the changelog
+#   @saithodev/semantic-release-gitea         → create the Forgejo release
+#   @semantic-release/git                     → push the git tag
+#
+# Required secrets: FORGEJO_TOKEN (user PAT with repo + workflow rights)
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+
+  release:
+    name: Semantic Release
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: https://data.forgejo.org/actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.FORGEJO_TOKEN }}
+
+      - name: Remember tag before release
+        id: before
+        run: |
+          TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Run semantic-release
+        env:
+          GITHUB_TOKEN: ${{ secrets.FORGEJO_TOKEN }}
+          GITEA_TOKEN: ${{ secrets.FORGEJO_TOKEN }}
+          GITEA_URL: "https://git.mon.k8b.co"
+          GIT_AUTHOR_NAME: "Sascha Willomitzer"
+          GIT_AUTHOR_EMAIL: "swi@thechameleonway.com"
+          GIT_COMMITTER_NAME: "Sascha Willomitzer"
+          GIT_COMMITTER_EMAIL: "swi@thechameleonway.com"
+        run: |
+          npm install --no-save \
+            semantic-release@24 \
+            "@semantic-release/commit-analyzer@13" \
+            "@semantic-release/release-notes-generator@14" \
+            "@saithodev/semantic-release-gitea@2" \
+            "@semantic-release/git@10"
+          npx semantic-release
+
+      - name: Detect new tag
+        id: after
+        run: |
+          TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Trigger publish job via workflow_dispatch
+        if: steps.after.outputs.tag != steps.before.outputs.tag && steps.after.outputs.tag != ''
+        env:
+          FORGEJO_TOKEN: ${{ secrets.FORGEJO_TOKEN }}
+          REPO: ${{ github.repository }}
+          NEW_TAG: ${{ steps.after.outputs.tag }}
+        run: |
+          python3 << 'EOF'
+          import os, json, urllib.request, urllib.error
+
+          token   = os.environ["FORGEJO_TOKEN"]
+          repo    = os.environ["REPO"]
+          new_tag = os.environ["NEW_TAG"]
+          api     = "https://git.mon.k8b.co/api/v1"
+          hdrs    = {"Authorization": f"token {token}", "Content-Type": "application/json"}
+
+          body = json.dumps({"ref": new_tag}).encode()
+          req  = urllib.request.Request(
+              f"{api}/repos/{repo}/actions/workflows/ci.yml/dispatches",
+              data=body, headers=hdrs, method="POST"
+          )
+          try:
+              with urllib.request.urlopen(req) as r:
+                  print(f"workflow_dispatch triggered for {new_tag} (HTTP {r.status})")
+          except urllib.error.HTTPError as e:
+              print(f"Dispatch failed: {e.code} {e.read().decode()}")
+              raise SystemExit(1)
+          EOF

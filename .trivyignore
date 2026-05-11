@@ -1,0 +1,18 @@
+# .trivyignore — fixable-but-unfixed CVEs as of helm 4.1.4 release (2026-04-09).
+#
+# These are HIGH/CRITICAL CVEs that Trivy reports as fixable, but where the
+# Helm upstream binary has not yet shipped the patched dependency. Re-evaluate
+# on every Helm bump; remove the entry as soon as Helm ships with the fix.
+#
+# Audit cadence: every PR that bumps HELM_VERSION must rerun the Trivy scan
+# locally and prune entries here.
+# Last audited: 2026-05-11 (against helm 4.1.4).
+
+# ── Go stdlib v1.25.9 — pending next Helm patch with Go 1.25.10+ ────────────
+# All five below are fixed in Go 1.25.10 / 1.26.3. Helm 4.1.4 was built with
+# Go 1.25.9. Should drop automatically with the next Helm patch release.
+CVE-2026-33811
+CVE-2026-33814
+CVE-2026-39820
+CVE-2026-39836
+CVE-2026-42499
