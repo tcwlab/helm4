@@ -410,7 +410,7 @@ jobs:
     runs-on: ubuntu-22.04
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     container:
-      image: alpine:3.23
+      image: alpine:3.24
     steps:
       - name: Checkout
         env:

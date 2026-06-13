@@ -15,7 +15,7 @@
 #####
 # STAGE 1: base image
 #####
-FROM --platform=$BUILDPLATFORM alpine:3.23 AS base
+FROM --platform=$BUILDPLATFORM alpine:3.24 AS base
 ARG BUILDPLATFORM
 # hadolint ignore=DL3018
 RUN apk add -U --no-cache curl tar git bash ca-certificates && \
